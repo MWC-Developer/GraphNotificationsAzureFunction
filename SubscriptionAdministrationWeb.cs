@@ -440,6 +440,8 @@ public sealed class SubscriptionAdministrationWeb
         builder.AppendLine("        .checkbox-list label { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }");
         builder.AppendLine("        .checkbox-list span { font-size: 0.85rem; color: #555; }");
         builder.AppendLine("        .checkbox-list span.helper-text { font-size: 0.75rem; color: #b34700; }");
+        builder.AppendLine("        .checkbox-list { max-height: 40vh; overflow-y: auto; padding-right: 4px; }");
+        builder.AppendLine("        .resource-group-header { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #0078d4; border-bottom: 1px solid #dde; margin: 8px 0 6px; padding-bottom: 2px; }");
         builder.AppendLine("        .form-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }");
         builder.AppendLine("        .helper-text { font-size: 0.75rem; color: #b34700; }");
         builder.AppendLine("        .resource-path { font-family: Consolas, monospace; font-size: 0.8rem; color: #333; display: block; }");
@@ -544,8 +546,20 @@ public sealed class SubscriptionAdministrationWeb
             ? "-"
             : _subscriptionSettings.ChangeType;
 
+        string? currentCategory = null;
         foreach (var option in _subscriptionSettings.ResourceOptions)
         {
+            if (!string.Equals(option.Category, currentCategory, StringComparison.Ordinal))
+            {
+                if (currentCategory is not null)
+                {
+                    builder.AppendLine("                </div>");  // close previous group
+                }
+                currentCategory = option.Category;
+                builder.AppendLine($"                <div class=\"resource-group\">");
+                builder.AppendLine($"                    <div class=\"resource-group-header\">{HtmlEncode(currentCategory)}</div>");
+            }
+
             var disabled = option.IsConfigured ? string.Empty : " disabled";
             var resourceTemplate = option.Resource ?? string.Empty;
             var encodedTemplate = HtmlEncode(resourceTemplate);
@@ -558,6 +572,11 @@ public sealed class SubscriptionAdministrationWeb
             builder.AppendLine($"                        <span class=\"resource-path\"{templateAttribute}>{note}</span>");
             builder.AppendLine($"                        <span class=\"helper-text\">({HtmlEncode(changeTypes ?? "missing")})</span>");
             builder.AppendLine("                    </label>");
+        }
+
+        if (currentCategory is not null)
+        {
+            builder.AppendLine("                </div>");  // close last group
         }
 
         builder.AppendLine("                </div>");

@@ -76,9 +76,9 @@ public sealed class GraphSubscriptionSettings
 
         foreach (var template in new[]
                  {
-                     (Key: "Mail", Display: "Mail"),
-                     (Key: "Calendar", Display: "Calendar"),
-                     (Key: "OneDrive", Display: "OneDrive")
+                     (Key: "Mail", Display: "Mail", Category: "Microsoft 365"),
+                     (Key: "Calendar", Display: "Calendar", Category: "Microsoft 365"),
+                     (Key: "OneDrive", Display: "OneDrive", Category: "Microsoft 365")
                  })
         {
             var resource = ResolveSetting(configuration,
@@ -93,10 +93,55 @@ public sealed class GraphSubscriptionSettings
                 $"GraphResource{template.Key}ChangeType",
                 $"GraphSubscriptionResource{template.Key}ChangeType") ?? ChangeType;
 
-            options.Add(new GraphResourceOption(template.Key.ToLowerInvariant(), template.Display, resource, changeType));
+            options.Add(new GraphResourceOption(template.Key.ToLowerInvariant(), template.Display, resource, changeType, template.Category));
         }
 
+        AddTeamsResourceOptions(options, configuration);
+
         return options;
+    }
+
+    private void AddTeamsResourceOptions(IList<GraphResourceOption> options, IConfiguration configuration)
+    {
+        // Teams resource templates: key, display name, default resource path, default change type
+        var teamsTemplates = new[]
+        {
+            (Key: "TeamsTeam",          Display: "Teams — Teams (all)",          DefaultResource: "/teams",                                                          DefaultChangeType: "created,updated,deleted"),
+            (Key: "TeamsTeamById",      Display: "Teams — Specific Team",         DefaultResource: "/teams/{id}",                                                     DefaultChangeType: "updated,deleted"),
+            (Key: "TeamsChannel",       Display: "Teams — Channels (all teams)",  DefaultResource: "/teams/getAllChannels",                                            DefaultChangeType: "created,updated,deleted"),
+            (Key: "TeamsChannelById",   Display: "Teams — Channels (one team)",   DefaultResource: "/teams/{id}/channels",                                            DefaultChangeType: "created,updated,deleted"),
+            (Key: "TeamsChat",          Display: "Teams — Chats (all)",           DefaultResource: "/chats",                                                          DefaultChangeType: "created,updated,deleted"),
+            (Key: "TeamsChatById",      Display: "Teams — Specific Chat",         DefaultResource: "/chats/{id}",                                                     DefaultChangeType: "updated,deleted"),
+            (Key: "TeamsChatByUser",    Display: "Teams — Chats (user)",          DefaultResource: "/users/{id}/chats",                                               DefaultChangeType: "created,updated,deleted"),
+            (Key: "TeamsChatMessage",   Display: "Teams — Messages (all chats)",  DefaultResource: "/chats/getAllMessages",                                            DefaultChangeType: "created,updated,deleted"),
+            (Key: "TeamsChatMessageByChat", Display: "Teams — Messages (one chat)", DefaultResource: "/chats/{id}/messages",                                          DefaultChangeType: "created,updated,deleted"),
+            (Key: "TeamsChannelMessage",Display: "Teams — Messages (all channels)", DefaultResource: "/teams/getAllMessages",                                          DefaultChangeType: "created,updated,deleted"),
+            (Key: "TeamsChannelMessageByTeam", Display: "Teams — Messages (one channel)", DefaultResource: "/teams/{id}/channels/{id}/messages",                       DefaultChangeType: "created,updated,deleted"),
+            (Key: "TeamsMember",        Display: "Teams — Members (team)",        DefaultResource: "/teams/{id}/members",                                             DefaultChangeType: "created,updated,deleted"),
+            (Key: "TeamsMemberChat",    Display: "Teams — Members (chat)",        DefaultResource: "/chats/{id}/members",                                             DefaultChangeType: "created,updated,deleted"),
+            (Key: "TeamsCallRecord",    Display: "Teams — Call Records",          DefaultResource: "/communications/callRecords",                                     DefaultChangeType: "created,updated"),
+            (Key: "TeamsCallRecording", Display: "Teams — Call Recordings (org)", DefaultResource: "/communications/onlineMeetings/getAllRecordings",                  DefaultChangeType: "created"),
+            (Key: "TeamsCallRecordingByUser", Display: "Teams — Call Recordings (user)", DefaultResource: "/users/{id}/onlineMeetings/getAllRecordings",              DefaultChangeType: "created"),
+            (Key: "TeamsCallTranscript",Display: "Teams — Transcripts (org)",     DefaultResource: "/communications/onlineMeetings/getAllTranscripts",                 DefaultChangeType: "created"),
+            (Key: "TeamsCallTranscriptByUser", Display: "Teams — Transcripts (user)", DefaultResource: "/users/{id}/onlineMeetings/getAllTranscripts",                DefaultChangeType: "created"),
+            (Key: "TeamsPresence",      Display: "Teams — Presence (user)",       DefaultResource: "/communications/presences/{id}",                                  DefaultChangeType: "updated"),
+            (Key: "TeamsApproval",      Display: "Teams — Approvals",             DefaultResource: "/solutions/approval/approvalItems",                               DefaultChangeType: "created,updated,deleted"),
+        };
+
+        foreach (var template in teamsTemplates)
+        {
+            var resource = ResolveSetting(configuration,
+                $"Graph:Resources:{template.Key}",
+                $"GraphSubscription:Resources:{template.Key}",
+                $"GraphResource{template.Key}") ?? template.DefaultResource;
+
+            var changeType = ResolveSetting(configuration,
+                $"Graph:Resources:{template.Key}ChangeType",
+                $"GraphSubscription:Resources:{template.Key}ChangeType",
+                $"GraphResource{template.Key}ChangeType") ?? template.DefaultChangeType;
+
+            options.Add(new GraphResourceOption(template.Key.ToLowerInvariant(), template.Display, resource, changeType, "Microsoft Teams"));
+        }
     }
 
     private static string? ResolveSetting(IConfiguration configuration, params string[] keys)
@@ -147,7 +192,7 @@ public sealed class GraphSubscriptionSettings
     }
 }
 
-public sealed record GraphResourceOption(string Key, string DisplayName, string? Resource, string? ChangeType)
+public sealed record GraphResourceOption(string Key, string DisplayName, string? Resource, string? ChangeType, string Category = "General")
 {
     public bool IsConfigured => !string.IsNullOrWhiteSpace(Resource);
 }
