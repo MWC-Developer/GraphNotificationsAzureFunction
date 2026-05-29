@@ -15,23 +15,53 @@ This solution demonstrates how to receive and manage **Microsoft Graph change no
 | **Notification storage** | Persists all received notifications (change and lifecycle) to **Azure Table Storage** |
 | **Administration UI** | Browser-based management page at `api/graph/manage` for viewing subscriptions and recent notifications |
 | **App-only authentication** | Uses `ClientSecretCredential` (Entra ID app registration with client secret) to authenticate against the Graph API |
-| **Multiple resource tracking** | Supports configuring subscriptions for Mail, Calendar, OneDrive, or any custom resource |
+| **Multiple resource tracking** | Supports configuring subscriptions for Mail, Calendar, OneDrive, Microsoft Teams resources, or any custom resource path |
+| **Scale-out via queues** | HTTP triggers enqueue notifications immediately and return 202; queue-triggered workers do all processing asynchronously |
+| **Rate limiting** | Proactive sliding-window limiter and reactive `Retry-After` honouring keep outbound Graph calls within the published 500-per-20-second threshold |
 
 ---
 
 ## Architecture Overview
 
+The solution uses a **two-stage pipeline** to decouple fast HTTP acknowledgement from slower downstream processing, allowing it to scale to thousands of concurrent subscriptions without being throttled by the Graph API or timing out Graph's webhook delivery window.
+
 ```
 Entra ID App Registration
-		│  (client credentials)
+		│  (client credentials flow)
 		▼
-GraphSubscriptionManager  ──────► Microsoft Graph API
-		│                          (create / list / delete subscriptions)
+GraphSubscriptionManager ──── GraphRateLimiter ──────► Microsoft Graph API
+		│                     (≤ 475 calls / 20 s)      (create / list /
+		│                                                 delete / reauthorize)
 		│
-Azure Function (HTTP triggers)
-  ├── api/graph/notifications  ◄── Graph sends change notifications
-  ├── api/graph/lifecycle      ◄── Graph sends lifecycle events
-  └── api/graph/manage         ◄── Browser administration UI
+Azure Function  ── HTTP triggers (fast path) ──────────────────────────────┐
+  ├── api/graph/notifications  ◄── Graph sends change notifications        │
+  │     • validates client state                                            │
+  │     • enqueues to graph-change-notifications                            │
+  │     • returns 202 immediately  ─────────────────────────────────────── │
+  ├── api/graph/lifecycle       ◄── Graph sends lifecycle events           │
+  │     • enqueues to graph-lifecycle-notifications                         │
+  │     • returns 202 immediately  ─────────────────────────────────────── │
+  └── api/graph/manage          ◄── Browser administration UI              │
+																			│
+Azure Storage Queues ◄──────────────────────────────────────────────────── ┘
+  ├── graph-change-notifications
+  └── graph-lifecycle-notifications
+		│
+		▼
+Azure Function  ── Queue triggers (async workers, scale-out)
+  ├── ProcessChangeNotification
+  │     • deserializes notification
+  │     • writes to Table Storage
+  └── ProcessLifecycleNotification
+		• deserializes notification
+		• writes to Table Storage
+		• calls LifecycleNotificationService (reauthorize / recreate / sync)
+			  │
+			  ▼
+		GraphSubscriptionManager (rate-limited)
+			  │
+			  ▼
+		Microsoft Graph API
 		│
 		▼
   Azure Table Storage
@@ -40,11 +70,81 @@ Azure Function (HTTP triggers)
 
 ---
 
+## Scaling Design
+
+### Why queues?
+
+Microsoft Graph expects a webhook endpoint to return **HTTP 2xx within 10 seconds**. If the function does storage writes and Graph API calls inline during that window, any latency spike (storage contention, Graph throttling, cold start) causes Graph to consider the delivery failed and retry — potentially triggering a cascade.
+
+By enqueuing immediately and returning 202, the HTTP function completes in milliseconds regardless of downstream load. The queue workers then process messages at whatever pace the system can sustain, independently of Graph's delivery clock.
+
+### Queue configuration (`host.json`)
+
+| Setting | Value | Effect |
+|---|---|---|
+| `batchSize` | `8` | Each worker instance pulls up to 8 messages at once |
+| `newBatchThreshold` | `4` | Fetches the next batch when fewer than 4 messages remain |
+| `visibilityTimeout` | `30 s` | Message reappears for retry if a worker crashes mid-flight |
+| `maxDequeueCount` | `5` | After 5 failed attempts the message is moved to the poison queue |
+| `dynamicConcurrencyEnabled` | `true` | Host automatically tunes concurrency based on measured throughput |
+| `snapshotPersistenceEnabled` | `true` | Concurrency snapshots survive restarts, avoiding cold-start over-scaling |
+
+Azure Functions automatically scales out the number of worker instances based on queue depth, so the solution handles bursts of thousands of notifications without manual intervention.
+
+### Queue names
+
+| Queue | Written by | Consumed by |
+|---|---|---|
+| `graph-change-notifications` | `HandleNotifications` HTTP trigger | `ProcessChangeNotification` queue trigger |
+| `graph-lifecycle-notifications` | `HandleLifecycleNotifications` HTTP trigger | `ProcessLifecycleNotification` queue trigger |
+
+Each queue message is a JSON-serialized `NotificationQueueMessage` envelope containing the raw `GraphNotification` and a category string (`"change"` or `"lifecycle"`).
+
+---
+
+## Rate Limiting
+
+### Published limit
+
+The Microsoft Graph subscriptions endpoint enforces a limit of **500 calls per 20 seconds** per application. With many lifecycle events arriving simultaneously (reauthorization requests, subscription-removed events) and multiple queue worker instances processing them concurrently, it is straightforward to exceed this threshold.
+
+### Two-layer defence (`GraphRateLimiter`)
+
+The `GraphRateLimiter` singleton is shared across all worker instances in the process and protects every outbound Graph call made by `GraphSubscriptionManager`.
+
+#### Layer 1 — Proactive (sliding-window token bucket)
+
+A `SlidingWindowRateLimiter` is configured with the permit budget divided into **four equal segments** over the window. Before every Graph request, the caller must `AcquireAsync` one permit. If the budget for the current window is exhausted, the caller is queued and waits until a new segment opens — Graph never sees more requests than the configured ceiling.
+
+Default values target **475 permits per 20-second window** (5 % headroom below the published limit), which leaves room for administrative calls from the management UI without risking a 429.
+
+#### Layer 2 — Reactive (Retry-After honouring)
+
+When Graph returns **HTTP 429 (Too Many Requests)** or **503 (Service Unavailable)**, `NotifyThrottled` is called. It:
+
+1. Parses the `Retry-After` response header (delta-seconds or HTTP-date).
+2. Records a **process-wide embargo timestamp** using a lock-free compare-and-swap on a `long` (UTC ticks), so two concurrent 429 responses always advance the embargo to the later of the two times.
+3. All callers in `AcquireAsync` check this embargo before acquiring a permit and wait out the remaining delay.
+
+The call is then **retried automatically** up to `MaxRetries` times (default 3), after honouring the embargo. This means a transient throttle is fully transparent to the caller.
+
+### Rate-limit configuration
+
+| Setting | Alt keys | Default | Description |
+|---|---|---|---|
+| `Graph:RateLimitPermits` | `GraphSubscription:RateLimitPermits` | `475` | Maximum Graph calls allowed per window |
+| `Graph:RateLimitWindowSeconds` | `GraphSubscription:RateLimitWindowSeconds` | `20` | Sliding window length in seconds |
+| `Graph:MaxRetries` | `GraphSubscription:MaxRetries` | `3` | Maximum retry attempts per call on a 429 or 503 response |
+
+These can be adjusted via app settings without redeployment — useful if Microsoft revises the published throttle limits.
+
+---
+
 ## Prerequisites
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download)
 - [Azure Functions Core Tools v4](https://learn.microsoft.com/azure/azure-functions/functions-run-local)
-- An **Azure Storage account** (or [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) for local development)
+- An **Azure Storage account** (or [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) for local development) — used for both the Table Storage notification log and the two Azure Storage Queues
 - A **Microsoft Entra ID app registration** with the appropriate Graph API permissions (see below)
 - A publicly reachable HTTPS URL for the function (use [dev tunnels](https://learn.microsoft.com/azure/developer/dev-tunnels/overview) or [ngrok](https://ngrok.com/) for local testing)
 
@@ -62,7 +162,9 @@ Azure Function (HTTP triggers)
    | Mail (`/users/{id}/messages`) | `Mail.Read` |
    | Calendar (`/users/{id}/events`) | `Calendars.Read` |
    | OneDrive (`/users/{id}/drive/root`) | `Files.Read.All` |
-   | All users' mail (`/users`) | `Mail.Read` |
+   | Teams chat messages (`/chats/getAllMessages`) | `Chat.Read.All` |
+   | Teams channel messages (`/teams/getAllMessages`) | `ChannelMessage.Read.All` |
+   | Teams presence (`/communications/presences/{id}`) | `Presence.Read.All` |
 
 5. Click **Grant admin consent** for your tenant.
 6. Note the **Application (client) ID** and **Directory (tenant) ID** from the Overview page.
@@ -94,12 +196,18 @@ Configure the function using `local.settings.json` for local development or **Ap
 	"GraphSubscriptionLifetimeMinutes": "60",
 
 	"GraphClientState": "<a-random-secret-string>",
-	"GraphNotificationsTableName": "GraphNotifications"
+	"GraphNotificationsTableName": "GraphNotifications",
+
+	"Graph:RateLimitPermits": "475",
+	"Graph:RateLimitWindowSeconds": "20",
+	"Graph:MaxRetries": "3"
   }
 }
 ```
 
 ### Configuration Reference
+
+#### Core settings
 
 | Setting | Alt keys | Description |
 |---|---|---|
@@ -114,6 +222,14 @@ Configure the function using `local.settings.json` for local development or **Ap
 | `GraphClientState` | `Graph:ClientState`, `GraphSubscription:ClientState` | Secret string echoed back by Graph; used to validate incoming notifications |
 | `GraphNotificationsTableName` | — | Azure Table Storage table name (default: `GraphNotifications`) |
 
+#### Rate limiting settings
+
+| Setting | Alt keys | Default | Description |
+|---|---|---|---|
+| `Graph:RateLimitPermits` | `GraphSubscription:RateLimitPermits` | `475` | Maximum Graph API calls allowed per rate-limit window |
+| `Graph:RateLimitWindowSeconds` | `GraphSubscription:RateLimitWindowSeconds` | `20` | Sliding window length in seconds (matches Graph's 20 s throttle window) |
+| `Graph:MaxRetries` | `GraphSubscription:MaxRetries` | `3` | Maximum retry attempts per call when Graph returns 429 or 503 |
+
 ---
 
 ## Creating a Graph Subscription
@@ -123,9 +239,10 @@ Configure the function using `local.settings.json` for local development or **Ap
 Once the function is running and reachable via HTTPS:
 
 1. Open `https://<your-function-host>/api/graph/manage` in a browser.
-2. Select a resource from the dropdown (or use the pre-configured default).
-3. Click **Create Subscription**.
-4. The page will show the new subscription ID, the resource it watches, and its expiry time.
+2. Select one or more resources from the list (grouped by category: Microsoft 365, Microsoft Teams, etc.).
+3. Enter a **User id** if any selected resource path contains `{id}`.
+4. Click **Create Subscription**.
+5. The page will show the new subscription ID, the resource it watches, and its expiry time.
 
 ### Option 2 — Microsoft Graph API (manual)
 
@@ -161,6 +278,7 @@ Graph will perform a **validation handshake** — it sends a GET request with a 
 
 ```powershell
 # Start Azurite (local storage emulator) in a separate terminal
+# Azurite provides both the Table Storage and the Queue Storage used by the function
 azurite --silent
 
 # Start the function host
@@ -170,6 +288,8 @@ func start
 
 Use a dev tunnel or ngrok to expose `http://localhost:7071` over HTTPS, then set `GraphNotificationUrl` and `GraphLifecycleNotificationUrl` to the tunnel URL.
 
+> **Note:** Azurite automatically creates the `graph-change-notifications` and `graph-lifecycle-notifications` queues on first use. No pre-creation is needed.
+
 ---
 
 ## Deploying to Azure
@@ -177,25 +297,29 @@ Use a dev tunnel or ngrok to expose `http://localhost:7071` over HTTPS, then set
 The solution includes a publish profile for Azure Functions **One Deploy**. You can deploy via Visual Studio (**Publish** menu) or the Azure CLI:
 
 ```powershell
-az functionapp deployment source config-zip \
-  --resource-group <rg> \
-  --name <function-app-name> \
+az functionapp deployment source config-zip `
+  --resource-group <rg> `
+  --name <function-app-name> `
   --src <path-to-zip>
 ```
 
 After deployment, the `WEBSITE_HOSTNAME` environment variable is set automatically, so `GraphNotificationUrl` and `GraphLifecycleNotificationUrl` are inferred if not explicitly configured.
 
+> **Storage account:** The same Azure Storage account referenced by `AzureWebJobsStorage` is used for Table Storage (notification log) and Queue Storage (processing pipeline). No additional storage resources are required.
+
 ---
 
 ## Lifecycle Event Handling
 
-Graph sends lifecycle events to the `api/graph/lifecycle` endpoint when:
+Graph sends lifecycle events to the `api/graph/lifecycle` endpoint. The HTTP trigger enqueues these immediately and returns 202. The `ProcessLifecycleNotification` queue worker then calls `LifecycleNotificationService`, which dispatches based on the event type:
 
 | Event | Action taken |
 |---|---|
-| `reauthorizationRequired` | Calls `subscriptions/{id}/reauthorize` on the Graph API |
-| `subscriptionRemoved` | Automatically creates a new subscription |
+| `reauthorizationRequired` | Calls `subscriptions/{id}/reauthorize` on the Graph API (rate-limited) |
+| `subscriptionRemoved` | Automatically creates a new subscription (rate-limited) |
 | `missed` | Triggers a full sync (logged; extend `PerformFullSyncAsync` for your use case) |
+
+All Graph API calls made during lifecycle handling pass through `GraphRateLimiter`, so a burst of reauthorization events from many subscriptions will be smoothed across the rate-limit window rather than causing a 429 cascade.
 
 ---
 
@@ -203,16 +327,20 @@ Graph sends lifecycle events to the `api/graph/lifecycle` endpoint when:
 
 | File | Purpose |
 |---|---|
-| `Program.cs` | Function host bootstrap and dependency injection |
-| `NotificationsWebhook.cs` | HTTP-triggered functions (notifications, lifecycle, management) |
-| `GraphSubscriptionManager.cs` | Graph API client for subscription CRUD operations |
-| `GraphSubscriptionSettings.cs` | Configuration binding and validation |
-| `LifecycleNotificationService.cs` | Handles Graph lifecycle events |
+| `Program.cs` | Function host bootstrap and dependency injection (registers `TableClient`, `GraphRateLimiter`, `GraphSubscriptionManager`, `LifecycleNotificationService`) |
+| `NotificationsWebhook.cs` | HTTP-triggered functions — validates requests, enqueues notifications, returns 202 immediately |
+| `NotificationsQueueProcessor.cs` | Queue-triggered workers — deserializes messages, writes to Table Storage, calls lifecycle service |
+| `GraphSubscriptionManager.cs` | Graph API client for subscription CRUD; all calls pass through `GraphRateLimiter` |
+| `GraphRateLimiter.cs` | Process-wide singleton enforcing the 475-per-20-second proactive limit and reactive `Retry-After` embargo |
+| `GraphSubscriptionSettings.cs` | Configuration binding, validation, and resource option catalogue (Mail, Calendar, OneDrive, Teams) |
+| `LifecycleNotificationService.cs` | Handles Graph lifecycle events: reauthorize, recreate, full sync |
 | `SubscriptionAdministrationWeb.cs` | Generates the browser-based admin UI |
-| `GraphNotificationModels.cs` | JSON models for Graph notification payloads |
+| `GraphNotificationModels.cs` | JSON models for Graph notification payloads, queue message envelope, multi-output binding types, and `NotificationEntity` |
+| `host.json` | Functions host configuration: dynamic concurrency, queue batch size, visibility timeout, dequeue limit |
 
 ---
 
 ## License
 
 See [LICENSE.txt](LICENSE.txt).
+
