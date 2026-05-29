@@ -38,16 +38,25 @@ public sealed class GraphSubscriptionManager : IGraphSubscriptionManager
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
+    // HTTP status codes that indicate Graph is throttling the caller.
+    private static readonly System.Net.HttpStatusCode[] ThrottleStatusCodes =
+    [
+        System.Net.HttpStatusCode.TooManyRequests,    // 429
+        System.Net.HttpStatusCode.ServiceUnavailable  // 503
+    ];
+
     private readonly GraphSubscriptionSettings _settings;
     private readonly HttpClient _httpClient;
     private readonly ILogger<GraphSubscriptionManager> _logger;
     private readonly TokenCredential? _credential;
+    private readonly GraphRateLimiter _rateLimiter;
 
-    public GraphSubscriptionManager(GraphSubscriptionSettings settings, IHttpClientFactory httpClientFactory, ILogger<GraphSubscriptionManager> logger)
+    public GraphSubscriptionManager(GraphSubscriptionSettings settings, IHttpClientFactory httpClientFactory, ILogger<GraphSubscriptionManager> logger, GraphRateLimiter rateLimiter)
     {
         _settings = settings;
         _httpClient = httpClientFactory.CreateClient(nameof(GraphSubscriptionManager));
         _logger = logger;
+        _rateLimiter = rateLimiter;
 
         if (_settings.IsConfigured)
         {
@@ -237,16 +246,47 @@ public sealed class GraphSubscriptionManager : IGraphSubscriptionManager
             throw new InvalidOperationException("Graph credential is not initialized.");
         }
 
-        var token = await _credential.GetTokenAsync(new TokenRequestContext(new[] { _settings.Scope }), cancellationToken).ConfigureAwait(false);
-        var request = new HttpRequestMessage(method, BuildRequestUri(relativeUrl));
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
-
-        if (payload != null)
+        var maxAttempts = _settings.MaxRetries + 1;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            request.Content = JsonContent.Create(payload, options: SerializerOptions);
+            // Acquire a rate-limit permit (and honour any active throttle embargo) before sending.
+            await _rateLimiter.AcquireAsync(cancellationToken).ConfigureAwait(false);
+
+            var token = await _credential.GetTokenAsync(new TokenRequestContext(new[] { _settings.Scope }), cancellationToken).ConfigureAwait(false);
+            var request = new HttpRequestMessage(method, BuildRequestUri(relativeUrl));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
+
+            if (payload != null)
+            {
+                request.Content = JsonContent.Create(payload, options: SerializerOptions);
+            }
+
+            var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+
+            // If Graph is throttling us, signal the limiter and retry (unless we've exhausted attempts).
+            if (Array.IndexOf(ThrottleStatusCodes, response.StatusCode) >= 0)
+            {
+                _rateLimiter.NotifyThrottled(response);
+
+                if (attempt < maxAttempts)
+                {
+                    _logger.LogWarning(
+                        "Graph returned HTTP {Status} on attempt {Attempt}/{Max} for {Method} {Url}. Will retry after throttle delay.",
+                        (int)response.StatusCode, attempt, maxAttempts, method, relativeUrl);
+                    response.Dispose();
+                    continue;
+                }
+
+                _logger.LogError(
+                    "Graph returned HTTP {Status} on final attempt {Attempt}/{Max} for {Method} {Url}. Giving up.",
+                    (int)response.StatusCode, attempt, maxAttempts, method, relativeUrl);
+            }
+
+            return response;
         }
 
-        return await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        // Unreachable — loop always returns or throws before exhausting.
+        throw new InvalidOperationException("Unexpected exit from retry loop.");
     }
 
     private string BuildRequestUri(string relativePath)

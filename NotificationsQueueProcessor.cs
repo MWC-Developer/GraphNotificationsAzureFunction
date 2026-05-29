@@ -11,9 +11,13 @@
  * THE SOFTWARE.
  * */
 
+using System;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
 using Azure.Data.Tables;
+using Azure.Storage.Queues.Models;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 
@@ -51,9 +55,10 @@ public sealed class NotificationsQueueProcessor
     /// </summary>
     [Function("ProcessChangeNotification")]
     public async Task ProcessChangeNotificationAsync(
-        [QueueTrigger("graph-change-notifications")] Azure.Storage.Queues.Models.QueueMessage messageText,
+        [QueueTrigger("graph-change-notifications")] QueueMessage queueMessage,
         CancellationToken cancellationToken)
     {
+        var messageText = queueMessage.MessageText.ToString();
         var message = DeserializeMessage(messageText);
         if (message is null)
         {
@@ -77,9 +82,10 @@ public sealed class NotificationsQueueProcessor
     /// </summary>
     [Function("ProcessLifecycleNotification")]
     public async Task ProcessLifecycleNotificationAsync(
-        [QueueTrigger("graph-lifecycle-notifications")] string messageText,
+        [QueueTrigger("graph-lifecycle-notifications")] QueueMessage queueMessage,
         CancellationToken cancellationToken)
     {
+        var messageText = queueMessage.MessageText.ToString();
         var message = DeserializeMessage(messageText);
         if (message is null)
         {

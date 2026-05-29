@@ -47,6 +47,16 @@ public sealed class GraphSubscriptionSettings
         Scope = ResolveSetting(configuration, "Graph:Scope", "GraphSubscription:Scope", "GraphScope") ?? DefaultScope;
         GraphBaseUrl = ResolveSetting(configuration, "Graph:BaseUrl", "GraphSubscription:BaseUrl", "GraphBaseUrl") ?? DefaultBaseUrl;
 
+        // Rate limiting — default 475 permits per 20 s (5 % headroom below the published 500/20 s limit).
+        var permitsSetting = ResolveSetting(configuration, "Graph:RateLimitPermits", "GraphSubscription:RateLimitPermits");
+        RateLimitPermits = int.TryParse(permitsSetting, out var parsedPermits) && parsedPermits > 0 ? parsedPermits : 475;
+
+        var windowSetting = ResolveSetting(configuration, "Graph:RateLimitWindowSeconds", "GraphSubscription:RateLimitWindowSeconds");
+        RateLimitWindowSeconds = int.TryParse(windowSetting, out var parsedWindow) && parsedWindow > 0 ? parsedWindow : 20;
+
+        var retriesSetting = ResolveSetting(configuration, "Graph:MaxRetries", "GraphSubscription:MaxRetries");
+        MaxRetries = int.TryParse(retriesSetting, out var parsedRetries) && parsedRetries >= 0 ? parsedRetries : 3;
+
         ResourceOptions = BuildResourceOptions(configuration);
     }
 
@@ -62,6 +72,15 @@ public sealed class GraphSubscriptionSettings
     public string Scope { get; }
     public string GraphBaseUrl { get; }
     public IReadOnlyList<GraphResourceOption> ResourceOptions { get; }
+
+    /// <summary>Maximum Graph API calls allowed within <see cref="RateLimitWindowSeconds"/>. Default 475.</summary>
+    public int RateLimitPermits { get; }
+
+    /// <summary>Sliding window length in seconds for the rate limit. Default 20.</summary>
+    public int RateLimitWindowSeconds { get; }
+
+    /// <summary>Maximum retry attempts on a throttled (429/503) response. Default 3.</summary>
+    public int MaxRetries { get; }
 
     public bool IsConfigured => GetMissingConfigurationFields().Count == 0;
 

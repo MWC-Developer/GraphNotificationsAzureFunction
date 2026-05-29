@@ -42,6 +42,7 @@ builder.Services.AddSingleton(sp =>
     return client;
 });
 builder.Services.AddSingleton(sp => new GraphSubscriptionSettings(sp.GetRequiredService<IConfiguration>()));
+builder.Services.AddSingleton<GraphRateLimiter>();
 builder.Services.AddSingleton<IGraphSubscriptionManager, GraphSubscriptionManager>();
 builder.Services.AddSingleton<ILifecycleNotificationService, LifecycleNotificationService>();
 
