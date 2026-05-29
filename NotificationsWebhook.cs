@@ -1,11 +1,18 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
+/*
+ * By David Barrett, Microsoft Ltd. Use at your own risk.  No warranties are given.
+ * 
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ * */
+
 using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
-using Azure;
+using System.Text.Json.Serialization;
 using Azure.Data.Tables;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -14,70 +21,90 @@ using Microsoft.Extensions.Logging;
 
 namespace GraphNotificationsAzureFunction;
 
-public class NotificationsWebhook
+/// <summary>
+/// HTTP-facing Azure Functions that receive Graph change and lifecycle notifications.
+/// Each function validates the incoming request and immediately enqueues the raw notifications
+/// for asynchronous processing by <see cref="NotificationsQueueProcessor"/>, then returns 202
+/// Accepted to Graph within the required timeout window.
+/// </summary>
+public sealed class NotificationsWebhook
 {
     private readonly ILogger<NotificationsWebhook> _logger;
-    private readonly TableClient _tableClient;
-    private readonly ILifecycleNotificationService _lifecycleNotificationService;
     private readonly IGraphSubscriptionManager _subscriptionManager;
     private readonly GraphSubscriptionSettings _subscriptionSettings;
+    private readonly TableClient _tableClient;
     private readonly SubscriptionAdministrationWeb _subscriptionAdministrationWeb;
-    private static readonly JsonSerializerOptions _serializerOptions = new(JsonSerializerDefaults.Web)
+
+    private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
     {
-        PropertyNameCaseInsensitive = true
+        PropertyNameCaseInsensitive = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
-    private static readonly string? _expectedClientState = Environment.GetEnvironmentVariable("GraphClientState");
+
+    private static readonly string? ExpectedClientState =
+        Environment.GetEnvironmentVariable("GraphClientState");
 
     public NotificationsWebhook(
         ILogger<NotificationsWebhook> logger,
-        ILifecycleNotificationService lifecycleNotificationService,
         IGraphSubscriptionManager subscriptionManager,
-        GraphSubscriptionSettings subscriptionSettings)
+        GraphSubscriptionSettings subscriptionSettings,
+        TableClient tableClient)
     {
         _logger = logger;
-        _lifecycleNotificationService = lifecycleNotificationService;
         _subscriptionManager = subscriptionManager;
         _subscriptionSettings = subscriptionSettings;
-        _tableClient = CreateTableClient();
-        _subscriptionAdministrationWeb = new SubscriptionAdministrationWeb(_logger, _subscriptionManager, _subscriptionSettings, _tableClient);
+        _tableClient = tableClient;
+        _subscriptionAdministrationWeb = new SubscriptionAdministrationWeb(
+            _logger, _subscriptionManager, _subscriptionSettings, _tableClient);
     }
 
+    /// <summary>
+    /// Receives Graph change notifications, validates client state, enqueues each notification,
+    /// and returns 202 Accepted immediately — no storage or Graph API calls on this hot path.
+    /// </summary>
     [Function("GraphNotifications")]
-    public async Task<IActionResult> HandleNotifications(
+    public async Task<ChangeNotificationWebhookOutput> HandleNotifications(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", "post", Route = "graph/notifications")] HttpRequest req,
         CancellationToken cancellationToken)
     {
         if (TryHandleValidation(req, out var validationResponse))
         {
-            return validationResponse;
+            return new ChangeNotificationWebhookOutput { HttpResponse = validationResponse };
         }
 
         var payload = await DeserializePayloadAsync(req);
         if (payload?.Value == null || payload.Value.Length == 0)
         {
-            _logger.LogWarning("Notification payload missing or empty.");
-            return new BadRequestResult();
+            _logger.LogWarning("Change notification payload missing or empty.");
+            return new ChangeNotificationWebhookOutput { HttpResponse = new BadRequestResult() };
         }
 
+        var messages = new List<string>(payload.Value.Length);
         foreach (var notification in payload.Value)
         {
             if (!IsClientStateValid(notification.ClientState))
             {
-                _logger.LogWarning("Client state mismatch for subscription {SubscriptionId}.", notification.SubscriptionId);
+                _logger.LogWarning("Client state mismatch for subscription {SubscriptionId}; skipping.", notification.SubscriptionId);
                 continue;
             }
 
-            _logger.LogInformation("Notification {ChangeType} for resource {Resource} (subscription {SubscriptionId}).",
-                notification.ChangeType,
-                notification.Resource,
-                notification.SubscriptionId);
+            _logger.LogInformation(
+                "Enqueuing change notification {ChangeType} for resource {Resource} (subscription {SubscriptionId}).",
+                notification.ChangeType, notification.Resource, notification.SubscriptionId);
 
-            await StoreNotificationAsync(notification, "change", cancellationToken);
+            messages.Add(SerializeQueueMessage(notification, "change"));
         }
 
-        return new AcceptedResult();
+        return new ChangeNotificationWebhookOutput
+        {
+            HttpResponse = new AcceptedResult(),
+            QueueMessages = messages.Count > 0 ? messages : null
+        };
     }
 
+    /// <summary>
+    /// Handles the subscription management UI (GET) and management actions (POST).
+    /// </summary>
     [Function("GraphNotificationsManagement")]
     public async Task<IActionResult> HandleManagementPage(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", "post", Route = "graph/manage")] HttpRequest req,
@@ -88,55 +115,45 @@ public class NotificationsWebhook
             .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Receives Graph lifecycle notifications (reauthorize, removed, missed) and enqueues each
+    /// one for asynchronous handling by <see cref="NotificationsQueueProcessor"/>.
+    /// </summary>
     [Function("GraphLifecycleNotifications")]
-    public async Task<IActionResult> HandleLifecycleNotifications(
+    public async Task<LifecycleNotificationWebhookOutput> HandleLifecycleNotifications(
         [HttpTrigger(AuthorizationLevel.Anonymous, "get", "post", Route = "graph/lifecycle")] HttpRequest req,
         CancellationToken cancellationToken)
     {
         if (TryHandleValidation(req, out var validationResponse))
         {
-            return validationResponse;
+            return new LifecycleNotificationWebhookOutput { HttpResponse = validationResponse };
         }
 
         var payload = await DeserializePayloadAsync(req);
         if (payload?.Value == null || payload.Value.Length == 0)
         {
-            _logger.LogWarning("Lifecycle payload missing or empty.");
-            return new BadRequestResult();
+            _logger.LogWarning("Lifecycle notification payload missing or empty.");
+            return new LifecycleNotificationWebhookOutput { HttpResponse = new BadRequestResult() };
         }
 
+        var messages = new List<string>(payload.Value.Length);
         foreach (var notification in payload.Value)
         {
-            _logger.LogInformation("Lifecycle event {LifecycleEvent} for subscription {SubscriptionId} expiring {Expiration}.",
-                notification.LifecycleEvent,
-                notification.SubscriptionId,
-                notification.SubscriptionExpirationDateTime);
+            _logger.LogInformation(
+                "Enqueuing lifecycle event {LifecycleEvent} for subscription {SubscriptionId} expiring {Expiration}.",
+                notification.LifecycleEvent, notification.SubscriptionId, notification.SubscriptionExpirationDateTime);
 
-            await StoreNotificationAsync(notification, "lifecycle", cancellationToken);
-            await _lifecycleNotificationService.ProcessAsync(notification, cancellationToken);
+            messages.Add(SerializeQueueMessage(notification, "lifecycle"));
         }
 
-        return new AcceptedResult();
+        return new LifecycleNotificationWebhookOutput
+        {
+            HttpResponse = new AcceptedResult(),
+            QueueMessages = messages.Count > 0 ? messages : null
+        };
     }
 
-    private static TableClient CreateTableClient()
-    {
-        var connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
-        if (string.IsNullOrWhiteSpace(connectionString))
-        {
-            throw new InvalidOperationException("AzureWebJobsStorage is not configured.");
-        }
-
-        var tableName = Environment.GetEnvironmentVariable("GraphNotificationsTableName");
-        if (string.IsNullOrWhiteSpace(tableName))
-        {
-            tableName = "GraphNotifications";
-        }
-
-        var client = new TableClient(connectionString, tableName);
-        client.CreateIfNotExists();
-        return client;
-    }
+    // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static bool TryHandleValidation(HttpRequest request, out IActionResult response)
     {
@@ -162,6 +179,7 @@ public class NotificationsWebhook
         {
             req.Body.Position = 0;
         }
+
         using var reader = new StreamReader(req.Body);
         var body = await reader.ReadToEndAsync();
         if (string.IsNullOrWhiteSpace(body))
@@ -169,62 +187,15 @@ public class NotificationsWebhook
             return null;
         }
 
-        return JsonSerializer.Deserialize<GraphNotificationEnvelope>(body, _serializerOptions);
+        return JsonSerializer.Deserialize<GraphNotificationEnvelope>(body, SerializerOptions);
     }
 
-    private static bool IsClientStateValid(string? clientState)
-    {
-        if (string.IsNullOrEmpty(_expectedClientState))
-        {
-            return true;
-        }
+    private static bool IsClientStateValid(string? clientState) =>
+        string.IsNullOrEmpty(ExpectedClientState) ||
+        string.Equals(ExpectedClientState, clientState, StringComparison.Ordinal);
 
-        return string.Equals(_expectedClientState, clientState, StringComparison.Ordinal);
-    }
-
-    private async Task StoreNotificationAsync(GraphNotification notification, string category, CancellationToken cancellationToken)
-    {
-        var partitionKey = notification.SubscriptionId ?? "unknown";
-        var rowKeyBase = notification.Id;
-        if (string.IsNullOrEmpty(rowKeyBase))
-        {
-            rowKeyBase = Guid.NewGuid().ToString("n");
-        }
-
-        var entity = new NotificationEntity
-        {
-            PartitionKey = partitionKey,
-            RowKey = string.Concat(category, "-", rowKeyBase),
-            Category = category,
-            ChangeType = notification.ChangeType,
-            LifecycleEvent = notification.LifecycleEvent,
-            Resource = notification.Resource,
-            SubscriptionExpirationDateTime = notification.SubscriptionExpirationDateTime,
-            ReceivedUtc = DateTimeOffset.UtcNow,
-            ResourceDataJson = GetResourceDataJson(notification.ResourceData)
-        };
-
-        await _tableClient.UpsertEntityAsync(entity, cancellationToken: cancellationToken);
-    }
-
-    private static string? GetResourceDataJson(JsonElement resourceData)
-    {
-        return resourceData.ValueKind == JsonValueKind.Undefined || resourceData.ValueKind == JsonValueKind.Null
-            ? null
-            : resourceData.GetRawText();
-    }
-    internal sealed class NotificationEntity : ITableEntity
-    {
-        public string PartitionKey { get; set; } = default!;
-        public string RowKey { get; set; } = default!;
-        public DateTimeOffset? Timestamp { get; set; }
-        public ETag ETag { get; set; }
-        public string? Category { get; set; }
-        public string? ChangeType { get; set; }
-        public string? LifecycleEvent { get; set; }
-        public string? Resource { get; set; }
-        public DateTimeOffset? SubscriptionExpirationDateTime { get; set; }
-        public DateTimeOffset ReceivedUtc { get; set; }
-        public string? ResourceDataJson { get; set; }
-    }
+    private static string SerializeQueueMessage(GraphNotification notification, string category) =>
+        JsonSerializer.Serialize(
+            new NotificationQueueMessage { Notification = notification, Category = category },
+            SerializerOptions);
 }
