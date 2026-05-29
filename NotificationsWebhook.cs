@@ -79,7 +79,8 @@ public sealed class NotificationsWebhook
             return new ChangeNotificationWebhookOutput { HttpResponse = new BadRequestResult() };
         }
 
-        var messages = new List<string>(payload.Value.Length);
+        var changeMessages = new List<string>(payload.Value.Length);
+        var lifecycleMessages = new List<string>();
         foreach (var notification in payload.Value)
         {
             if (!IsClientStateValid(notification.ClientState))
@@ -88,17 +89,33 @@ public sealed class NotificationsWebhook
                 continue;
             }
 
+            // A lifecycle event (reauthorizationRequired, subscriptionRemoved, missed) landing here
+            // means the subscription was registered with LifecycleNotificationUrl pointing at this
+            // endpoint instead of /api/graph/lifecycle. Re-route it to the correct queue so renewal
+            // still happens, and log a warning so the misconfiguration is visible.
+            if (!string.IsNullOrWhiteSpace(notification.LifecycleEvent))
+            {
+                _logger.LogWarning(
+                    "Lifecycle event {LifecycleEvent} for subscription {SubscriptionId} arrived on the change-notification endpoint. " +
+                    "Check that Graph:LifecycleNotificationUrl points to /api/graph/lifecycle, not /api/graph/notifications. " +
+                    "Re-routing to lifecycle queue.",
+                    notification.LifecycleEvent, notification.SubscriptionId);
+                lifecycleMessages.Add(SerializeQueueMessage(notification, "lifecycle"));
+                continue;
+            }
+
             _logger.LogInformation(
                 "Enqueuing change notification {ChangeType} for resource {Resource} (subscription {SubscriptionId}).",
                 notification.ChangeType, notification.Resource, notification.SubscriptionId);
 
-            messages.Add(SerializeQueueMessage(notification, "change"));
+            changeMessages.Add(SerializeQueueMessage(notification, "change"));
         }
 
         return new ChangeNotificationWebhookOutput
         {
             HttpResponse = new AcceptedResult(),
-            QueueMessages = messages.Count > 0 ? messages : null
+            QueueMessages = changeMessages.Count > 0 ? changeMessages : null,
+            LifecycleQueueMessages = lifecycleMessages.Count > 0 ? lifecycleMessages : null
         };
     }
 

@@ -1,10 +1,16 @@
 {
   "version": "2.0",
   "logging": {
+    "logLevel": {
+      "default": "Warning",
+      "GraphNotificationsAzureFunction": "Information",
+      "Host.Results": "Error",
+      "Function": "Information"
+    },
     "applicationInsights": {
       "samplingSettings": {
         "isEnabled": true,
-        "excludedTypes": "Request"
+        "excludedTypes": "Request;Trace;Exception"
       },
       "enableLiveMetricsFilters": true
     }

@@ -95,13 +95,25 @@ public sealed class NotificationsQueueProcessor
 
         var notification = message.Notification;
         _logger.LogInformation(
-            "Processing queued lifecycle event {LifecycleEvent} for subscription {SubscriptionId} expiring {Expiration}.",
+            "[Lifecycle] Dequeued event {LifecycleEvent} for subscription {SubscriptionId} (current expiry {Expiration}). Processing now.",
             notification.LifecycleEvent,
             notification.SubscriptionId,
             notification.SubscriptionExpirationDateTime);
 
         await StoreNotificationAsync(notification, message.Category, cancellationToken).ConfigureAwait(false);
-        await _lifecycleNotificationService.ProcessAsync(notification, cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            await _lifecycleNotificationService.ProcessAsync(notification, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "[Lifecycle] Unhandled exception while processing {LifecycleEvent} for subscription {SubscriptionId}.",
+                notification.LifecycleEvent,
+                notification.SubscriptionId);
+            throw; // re-throw so the queue message is retried / dead-lettered
+        }
     }
 
     private async Task StoreNotificationAsync(GraphNotification notification, string category, CancellationToken cancellationToken)

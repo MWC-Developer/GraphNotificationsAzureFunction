@@ -56,12 +56,22 @@ public sealed class LifecycleNotificationService : ILifecycleNotificationService
                     // reauthorization and renewal in a single request. The docs also warn never to
                     // call /reauthorize and PATCH within the same 10-minute window, so we do only
                     // the PATCH here.
+                    _logger.LogInformation(
+                        "Lifecycle reauthorizationRequired received for subscription {SubscriptionId} (current expiry {Expiration}). Initiating renewal via PATCH.",
+                        notification.SubscriptionId,
+                        notification.SubscriptionExpirationDateTime);
                     await _subscriptionManager.RenewSubscriptionAsync(notification.SubscriptionId ?? string.Empty, cancellationToken).ConfigureAwait(false);
                     break;
                 case "subscriptionremoved":
+                    _logger.LogInformation(
+                        "Lifecycle subscriptionRemoved received for subscription {SubscriptionId}. Recreating subscription.",
+                        notification.SubscriptionId);
                     await _subscriptionManager.CreateSubscriptionAsync(cancellationToken).ConfigureAwait(false);
                     break;
                 case "missed":
+                    _logger.LogInformation(
+                        "Lifecycle missed received for subscription {SubscriptionId}. Triggering full data sync.",
+                        notification.SubscriptionId);
                     await _subscriptionManager.PerformFullSyncAsync(cancellationToken).ConfigureAwait(false);
                     break;
                 default:

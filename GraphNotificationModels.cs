@@ -74,6 +74,13 @@ public sealed class ChangeNotificationWebhookOutput
 
     [QueueOutput("graph-change-notifications")]
     public IEnumerable<string>? QueueMessages { get; init; }
+
+    /// <summary>
+    /// Lifecycle events that arrived on the change-notification endpoint due to a misconfigured
+    /// LifecycleNotificationUrl are re-routed here so they still reach the correct processor.
+    /// </summary>
+    [QueueOutput("graph-lifecycle-notifications")]
+    public IEnumerable<string>? LifecycleQueueMessages { get; init; }
 }
 
 /// <summary>Multi-output return type for the lifecycle-notification HTTP trigger.</summary>

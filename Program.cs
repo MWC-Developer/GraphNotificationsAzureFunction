@@ -18,6 +18,7 @@ using Microsoft.Azure.Functions.Worker.Builder;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 var builder = FunctionsApplication.CreateBuilder(args);
 
@@ -26,6 +27,22 @@ builder.ConfigureFunctionsWebApplication();
 builder.Services
     .AddApplicationInsightsTelemetryWorkerService()
     .ConfigureFunctionsApplicationInsights();
+
+// ConfigureFunctionsApplicationInsights() installs a post-configure rule that raises the
+// Application Insights log level back to Warning, overriding any AddFilter calls made here.
+// Remove that rule so our namespace filter (Information) is not silently discarded.
+builder.Logging.Services.Configure<Microsoft.Extensions.Logging.LoggerFilterOptions>(options =>
+{
+    var aiRule = options.Rules.FirstOrDefault(r =>
+        r.ProviderName == "Microsoft.Extensions.Logging.ApplicationInsights.ApplicationInsightsLoggerProvider");
+    if (aiRule is not null)
+    {
+        options.Rules.Remove(aiRule);
+    }
+});
+
+builder.Logging.SetMinimumLevel(LogLevel.Warning);
+builder.Logging.AddFilter("GraphNotificationsAzureFunction", LogLevel.Information);
 
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton(sp =>

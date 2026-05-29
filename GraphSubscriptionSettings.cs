@@ -30,7 +30,6 @@ public sealed class GraphSubscriptionSettings
         NotificationUrl = ResolveSetting(configuration, "Graph:NotificationUrl", "GraphSubscription:NotificationUrl", "GraphNotificationUrl")
             ?? BuildUrlFromHost("graph/notifications");
         LifecycleNotificationUrl = ResolveSetting(configuration, "Graph:LifecycleNotificationUrl", "GraphSubscription:LifecycleNotificationUrl", "GraphLifecycleNotificationUrl")
-            ?? NotificationUrl
             ?? BuildUrlFromHost("graph/lifecycle");
         ClientState = ResolveSetting(configuration, "Graph:ClientState", "GraphSubscription:ClientState", "GraphClientState");
 

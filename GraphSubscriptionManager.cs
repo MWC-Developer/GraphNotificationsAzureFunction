@@ -97,7 +97,7 @@ public sealed class GraphSubscriptionManager : IGraphSubscriptionManager
     /// </summary>
     public async Task RenewSubscriptionAsync(string subscriptionId, CancellationToken cancellationToken)
     {
-        if (!EnsureConfigured())
+        if (!EnsureCredentialsConfigured())
         {
             return;
         }
@@ -111,14 +111,38 @@ public sealed class GraphSubscriptionManager : IGraphSubscriptionManager
         var newExpiration = DateTimeOffset.UtcNow.Add(_settings.SubscriptionLifetime);
         var patchPayload = new SubscriptionRenewalRequest { ExpirationDateTime = newExpiration };
 
-        var response = await SendGraphRequestAsync(new HttpMethod("PATCH"), $"subscriptions/{subscriptionId}", patchPayload, cancellationToken).ConfigureAwait(false);
-        await HandleResponseAsync(response, () =>
+        _logger.LogInformation(
+            "[Renewal] Sending PATCH for subscription {SubscriptionId}: requesting new expiry {Expiration}.",
+            subscriptionId, newExpiration);
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await SendGraphRequestAsync(HttpMethod.Patch, $"subscriptions/{subscriptionId}", patchPayload, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "[Renewal] Exception while sending PATCH for subscription {SubscriptionId}.",
+                subscriptionId);
+            throw;
+        }
+
+        if (response.IsSuccessStatusCode)
         {
             _logger.LogInformation(
-                "Renewed subscription {SubscriptionId}: new expiry {Expiration}.",
+                "[Renewal] PATCH succeeded for subscription {SubscriptionId}: new expiry {Expiration}.",
                 subscriptionId, newExpiration);
-            return Task.CompletedTask;
-        }, subscriptionId, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            _logger.LogError(
+                "[Renewal] PATCH failed for subscription {SubscriptionId}: HTTP {Status} — {Body}.",
+                subscriptionId, (int)response.StatusCode, body);
+            throw new InvalidOperationException(
+                $"Renewal PATCH for subscription {subscriptionId} failed with status {(int)response.StatusCode}: {body}");
+        }
     }
 
     public async Task<string?> CreateSubscriptionAsync(CancellationToken cancellationToken)
@@ -350,6 +374,27 @@ public sealed class GraphSubscriptionManager : IGraphSubscriptionManager
             _logger.LogWarning("Graph subscription credentials are unavailable. Verify tenant id, client id, and client secret.");
         }
 
+        return false;
+    }
+
+    /// <summary>
+    /// Checks only that credentials (tenant, client id, secret) are present.
+    /// Used by operations that do not need NotificationUrl or LifecycleNotificationUrl,
+    /// such as renewing or deleting an existing subscription.
+    /// </summary>
+    private bool EnsureCredentialsConfigured()
+    {
+        if (_credential != null &&
+            !string.IsNullOrWhiteSpace(_settings.TenantId) &&
+            !string.IsNullOrWhiteSpace(_settings.ClientId) &&
+            !string.IsNullOrWhiteSpace(_settings.ClientSecret))
+        {
+            return true;
+        }
+
+        _logger.LogWarning(
+            "Graph credentials are unavailable (TenantId/ClientId/ClientSecret missing or credential not initialised). " +
+            "Renewal will be skipped. Verify Graph:TenantId, Graph:ClientId, and Graph:ClientSecret app settings.");
         return false;
     }
 
