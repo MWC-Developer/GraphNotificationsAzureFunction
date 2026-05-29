@@ -664,7 +664,11 @@ public sealed class SubscriptionAdministrationWeb
         builder.AppendLine("                <option value=\"10\">10s</option>");
         builder.AppendLine("                <option value=\"30\">30s</option>");
         builder.AppendLine("                <option value=\"60\">1m</option>");
+        builder.AppendLine("                <option value=\"300\">5m</option>");
+        builder.AppendLine("                <option value=\"540\">9m</option>");
         builder.AppendLine("                <option value=\"600\">10m</option>");
+        builder.AppendLine("                <option value=\"1800\">30m</option>");
+        builder.AppendLine("                <option value=\"3600\">60m</option>");
         builder.AppendLine("            </select>");
         builder.AppendLine("            <form method=\"post\" class=\"clear-events-form\" onsubmit=\"return confirm('Clear all stored events?');\">");
         builder.AppendLine("                <input type=\"hidden\" name=\"action\" value=\"clear-events\" />");
