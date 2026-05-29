@@ -49,7 +49,14 @@ public sealed class LifecycleNotificationService : ILifecycleNotificationService
             switch (lifecycleEvent.ToLowerInvariant())
             {
                 case "reauthorizationrequired":
-                    await _subscriptionManager.ReauthorizeAsync(notification.SubscriptionId ?? string.Empty, cancellationToken).ConfigureAwait(false);
+                    // The Graph docs are explicit: POST /reauthorize satisfies the auth challenge
+                    // but does NOT extend the subscription lifetime — the subscription will still
+                    // expire at its original time and be removed by Graph.
+                    // PATCH /subscriptions/{id} with a new expirationDateTime performs both
+                    // reauthorization and renewal in a single request. The docs also warn never to
+                    // call /reauthorize and PATCH within the same 10-minute window, so we do only
+                    // the PATCH here.
+                    await _subscriptionManager.RenewSubscriptionAsync(notification.SubscriptionId ?? string.Empty, cancellationToken).ConfigureAwait(false);
                     break;
                 case "subscriptionremoved":
                     await _subscriptionManager.CreateSubscriptionAsync(cancellationToken).ConfigureAwait(false);

@@ -24,6 +24,7 @@ namespace GraphNotificationsAzureFunction;
 public interface IGraphSubscriptionManager
 {
     Task ReauthorizeAsync(string subscriptionId, CancellationToken cancellationToken);
+    Task RenewSubscriptionAsync(string subscriptionId, CancellationToken cancellationToken);
     Task<string?> CreateSubscriptionAsync(CancellationToken cancellationToken);
     Task<string?> CreateSubscriptionAsync(string resource, string? changeType, CancellationToken cancellationToken);
     Task PerformFullSyncAsync(CancellationToken cancellationToken);
@@ -82,6 +83,40 @@ public sealed class GraphSubscriptionManager : IGraphSubscriptionManager
         await HandleResponseAsync(response, () =>
         {
             _logger.LogInformation("Reauthorized subscription {SubscriptionId}.", subscriptionId);
+            return Task.CompletedTask;
+        }, subscriptionId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Renews the subscription expiry <b>and</b> satisfies any outstanding reauthorization challenge
+    /// in a single PATCH request. This is the correct response to a <c>reauthorizationRequired</c>
+    /// lifecycle event: calling only <c>POST /reauthorize</c> satisfies the auth challenge but does
+    /// NOT extend the subscription lifetime, so the subscription will still expire on schedule.
+    /// The Graph documentation explicitly states: <em>"Reauthorizing your endpoint doesn't renew
+    /// your subscription. However, renewing your subscription also reauthorizes your endpoint."</em>
+    /// </summary>
+    public async Task RenewSubscriptionAsync(string subscriptionId, CancellationToken cancellationToken)
+    {
+        if (!EnsureConfigured())
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(subscriptionId))
+        {
+            _logger.LogWarning("Cannot renew subscription because the subscriptionId is missing.");
+            return;
+        }
+
+        var newExpiration = DateTimeOffset.UtcNow.Add(_settings.SubscriptionLifetime);
+        var patchPayload = new SubscriptionRenewalRequest { ExpirationDateTime = newExpiration };
+
+        var response = await SendGraphRequestAsync(new HttpMethod("PATCH"), $"subscriptions/{subscriptionId}", patchPayload, cancellationToken).ConfigureAwait(false);
+        await HandleResponseAsync(response, () =>
+        {
+            _logger.LogInformation(
+                "Renewed subscription {SubscriptionId}: new expiry {Expiration}.",
+                subscriptionId, newExpiration);
             return Task.CompletedTask;
         }, subscriptionId, cancellationToken).ConfigureAwait(false);
     }
@@ -382,6 +417,16 @@ public sealed class GraphSubscriptionManager : IGraphSubscriptionManager
 
         [JsonPropertyName("clientState")]
         public string? ClientState { get; init; }
+    }
+
+    /// <summary>
+    /// Minimal PATCH body: only <c>expirationDateTime</c> is sent so that Graph does not
+    /// inadvertently reset other subscription properties.
+    /// </summary>
+    private sealed class SubscriptionRenewalRequest
+    {
+        [JsonPropertyName("expirationDateTime")]
+        public DateTimeOffset ExpirationDateTime { get; init; }
     }
 }
 
